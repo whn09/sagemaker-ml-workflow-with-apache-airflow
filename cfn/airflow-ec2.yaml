@@ -93,6 +93,9 @@ Resources:
           # Upgrade awscli
           echo "Updating awscli"
           python -m pip install awscli --upgrade --user
+          python -m pip uninstall marshmallow-sqlalchemy
+          python -m pip install marshmallow-sqlalchemy==0.17.1
+          python -m pip install config
           # Install airflow using pip
           echo "Installing Apache Airflow"
           export AIRFLOW_GPL_UNIDECODE=yes
@@ -115,7 +118,7 @@ Resources:
           echo "Installing s3fs"
           python -m pip install --upgrade s3fs --user
           echo "Installing sagemaker sdk"
-          python -m pip install sagemaker --user
+          python -m pip install sagemaker==v1.39.2 --user
           # Initialize Airflow
           airflow initdb
           # Update the RDS connection in the Airflow Config file
@@ -143,7 +146,7 @@ Resources:
           mkdir -p ~/airflow/dags/sm-ml-pipeline
           # clone the git repository
           cd ~
-          git clone https://github.com/aws-samples/sagemaker-ml-workflow-with-apache-airflow.git
+          git clone https://github.com/whn09/sagemaker-ml-workflow-with-apache-airflow.git
           mv ~/sagemaker-ml-workflow-with-apache-airflow ~/sm-ml-pipeline
           cd ~/sm-ml-pipeline/src
           # prepare airflow dag definition for sagemaker blog post
