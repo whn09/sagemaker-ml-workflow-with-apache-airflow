@@ -1,0 +1,257 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Airflow server backed by Postgres RDS
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access into the Airflow web server
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair
+  S3BucketName:
+    Description: REQUIRED - A new S3 Bucket name. This bucket will be used by Sagemaker for reading and writing model artifacts or hosting data
+    Type: String
+    AllowedPattern: ".+"
+  DBPassword:
+    NoEcho: "true"
+    Description: Airflow database admin account password
+    Type: String
+    MinLength: "8"
+    MaxLength: "41"
+    AllowedPattern: "[a-zA-Z0-9]*"
+    ConstraintDescription: Must contain only alphanumeric characters
+
+# Mapping to find the Amazon Linux AMI in each region.
+Mappings:
+  RegionMap:
+    cn-north-1:
+      AMI: "ami-0c1c539eca996ffba"
+    cn-northwest-1:
+      AMI: "ami-0fbceead693066e25"
+
+Resources:
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      KeyName: !Ref "KeyName"
+      SecurityGroups: [!Ref "AirflowEC2SecurityGroup"]
+      InstanceType: "m4.xlarge"
+      IamInstanceProfile:
+        Ref: EC2InstanceProfile
+      Tags:
+        - Key: Name
+          Value: Airflow
+      ImageId: !FindInMap
+        - RegionMap
+        - !Ref "AWS::Region"
+        - AMI
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -x
+          exec > >(tee /var/log/user-data.log|logger -t user-data ) 2>&1
+          # Install python3 and its dependencies
+          sudo yum install python3 python3-devel gcc gcc-c++ -y
+          # Get latest version of pip (pip 10 breaks airflow installation hence moving to stable pip version)
+          curl -O https://bootstrap.pypa.io/get-pip.py
+          python3 get-pip.py
+          python3 -m pip install pip==9.0.3 -i https://opentuna.cn/pypi/web/simple --user
+          # Get the latest CloudFormation package
+          echo "Installing aws-cfn"
+          sudo yum install -y aws-cfn-bootstrap
+          # Start cfn-init
+          /opt/aws/bin/cfn-init -v -c install --stack ${AWS::StackId} --resource EC2Instance --region ${AWS::Region}
+          # Install git
+          echo "Installing git"
+          sudo yum install -y git
+          # Install boto3
+          echo "Updating boto3"
+          python3 -m pip install boto3 -i https://opentuna.cn/pypi/web/simple --upgrade --user
+          # Upgrade awscli
+          echo "Updating awscli"
+          python3 -m pip install awscli -i https://opentuna.cn/pypi/web/simple --upgrade --user
+          python3 -m pip uninstall marshmallow-sqlalchemy
+          python3 -m pip install marshmallow-sqlalchemy==0.17.1 -i https://opentuna.cn/pypi/web/simple
+          python3 -m pip install config -i https://opentuna.cn/pypi/web/simple
+          python3 -m pip install urllib3==1.25.10 -i https://opentuna.cn/pypi/web/simple
+          # Install airflow using pip
+          echo "Installing Apache Airflow"
+          export AIRFLOW_GPL_UNIDECODE=yes
+          python3 -m pip install apache-airflow==1.10.10 -i https://opentuna.cn/pypi/web/simple --user
+          # Encrypt connection passwords in metadata db
+          python3 -m pip install apache-airflow[crypto] -i https://opentuna.cn/pypi/web/simple --user
+          # Postgres operators and hook, support as an Airflow backend
+          python3 -m pip install apache-airflow[postgres] -i https://opentuna.cn/pypi/web/simple --user
+          python3 -m pip install six==1.10.0 -i https://opentuna.cn/pypi/web/simple --user
+          python3 -m pip install --upgrade six -i https://opentuna.cn/pypi/web/simple --user
+          python3 -m pip install markupsafe -i https://opentuna.cn/pypi/web/simple --user
+          python3 -m pip install --upgrade MarkupSafe -i https://opentuna.cn/pypi/web/simple --user
+          echo 'export PATH=/usr/local/bin:~/.local/bin:$PATH' >> ~/.bash_profile
+          source ~/.bash_profile
+          # Install pandas and numpy for data processing
+          echo "Installing numpy"
+          python3 -m pip install --upgrade numpy -i https://opentuna.cn/pypi/web/simple --user
+          echo "Installing pandas"
+          python3 -m pip install --upgrade pandas -i https://opentuna.cn/pypi/web/simple --user
+          echo "Installing s3fs"
+          python3 -m pip install --upgrade s3fs==0.4.2 -i https://opentuna.cn/pypi/web/simple --user
+          echo "Installing sagemaker sdk"
+          python3 -m pip install sagemaker==v1.72 -i https://opentuna.cn/pypi/web/simple --user
+          # Initialize Airflow
+          airflow initdb
+          # Update the RDS connection in the Airflow Config file
+          sed -i '/sql_alchemy_conn/s/^/#/g' ~/airflow/airflow.cfg
+          sed -i '/sql_alchemy_conn/ a sql_alchemy_conn = postgresql://airflow:${DBPassword}@${DBInstance.Endpoint.Address}:${DBInstance.Endpoint.Port}/airflowdb' ~/airflow/airflow.cfg
+          # Update the type of executor in the Airflow Config file
+          sed -i '/executor = SequentialExecutor/s/^/#/g' ~/airflow/airflow.cfg
+          sed -i '/executor = SequentialExecutor/ a executor = LocalExecutor' ~/airflow/airflow.cfg
+          sed -i 's/load_examples = True/load_examples = False/g' ~/airflow/airflow.cfg
+          airflow initdb
+          # create airflow connection to sagemaker
+          cat >> /tmp/airflow_conn.py << EOF
+          from airflow import settings
+          from airflow.models import Connection
+          #create a connection object
+          extra = '{"region_name": "${AWS::Region}"}'
+          conn_id = 'airflow-sagemaker'
+          conn = Connection(conn_id=conn_id,conn_type='aws', extra=extra)
+          # get the session
+          session = settings.Session()
+          session.add(conn)
+          session.commit()
+          EOF
+          python3 /tmp/airflow_conn.py
+          # create directories
+          mkdir -p ~/airflow/dags/sm-ml-pipeline
+          # clone the git repository
+          cd ~
+          git clone https://github.com/whn09/sagemaker-ml-workflow-with-apache-airflow.git
+          mv ~/sagemaker-ml-workflow-with-apache-airflow ~/sm-ml-pipeline
+          cd ~/sm-ml-pipeline/src
+          # prepare airflow dag definition for sagemaker blog post
+          sed -i 's/<s3-bucket>/${S3BucketName}/g' ./*.*
+          sed -i 's/<region-name>/${AWS::Region}/g' ./*.*
+          zip -r dag.zip *
+          cp dag.zip ~/airflow/dags/sm-ml-pipeline/dag.zip
+          cd -
+          # Run Airflow webserver and scheduler
+          airflow list_dags
+          airflow webserver -p 8888 -D
+          airflow scheduler -D
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          install:
+            - gcc
+        gcc:
+          packages:
+            yum:
+              gcc: []
+    DependsOn:
+      - DBInstance
+      - AirflowEC2SecurityGroup
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBName: airflowdb
+      Engine: postgres
+      MasterUsername: airflow
+      MasterUserPassword: !Ref "DBPassword"
+      DBInstanceClass: db.t2.small
+      AllocatedStorage: 5
+  AirflowEC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: AirflowEC2SG
+      GroupDescription: Enable HTTP access via port 80 + SSH access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8888
+          ToPort: 8888
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AirflowInstanceRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com.cn"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws-cn:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: AirflowResourceAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub "arn:aws-cn:s3:::${S3BucketName}"
+                  - !Sub "arn:aws-cn:s3:::${S3BucketName}/*"
+              - Effect: Allow
+                Action:
+                  - iam:GetRole
+                Resource: "*"
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: AirflowInstanceProfile
+      Roles:
+        - Ref: EC2Role
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      AccessControl: BucketOwnerFullControl
+      BucketName: !Ref "S3BucketName"
+  AirflowSageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AirflowSageMakerExecutionRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "sagemaker.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws-cn:iam::aws:policy/AmazonSageMakerFullAccess
+      Path: "/service-role/"
+      Policies:
+        - PolicyName: SageMakerS3BucketAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub "arn:aws-cn:s3:::${S3BucketName}"
+                  - !Sub "arn:aws-cn:s3:::${S3BucketName}/*"
+Outputs:
+  AirflowEC2PublicDNSName:
+    Description: Public DNS Name of the Airflow EC2 instance
+    Value: !Join ["", ["http://", !GetAtt EC2Instance.PublicDnsName, ":8888"]]
